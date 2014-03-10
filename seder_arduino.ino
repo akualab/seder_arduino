@@ -44,26 +44,37 @@ Adafruit_CC3000 cc3000 = Adafruit_CC3000(ADAFRUIT_CC3000_CS, ADAFRUIT_CC3000_IRQ
 // Security can be WLAN_SEC_UNSEC, WLAN_SEC_WEP, WLAN_SEC_WPA or WLAN_SEC_WPA2
 #define WLAN_SECURITY   WLAN_SEC_WPA2
 
-#define SAMP_PERIOD 500 // sampling period in millisec
+#define SEDER_SERVER 10.1.0.250:3000
+#define SAMP_PERIOD 200 // sampling period in millisec
 #define TIME_SERVER_PERIOD 86400000 // period to request time for server in millisec
+#define NUM_SAMP_PER_MSG 100 // number of sample periods between REST messages
+#define MAX_SENSORS 4 // needed to allocate array of sensors (better way?)
 
 Adafruit_CC3000_Client client;
 
 const unsigned long
   connectTimeout  = 15L * 1000L, // Max time to wait for server connection
   responseTimeout = 15L * 1000L; // Max time to wait for data from server
-int
-  countdown       = 0;  // loop() iterations until next time server query
+unsigned int
+  sampIndex       = 0;  // current sample index - range is 0 .. NUM_SAMP_PER_MSG - 1
 unsigned long
   lastPolledTime  = 0L, // Last value retrieved from time server
   sketchTime      = 0L, // CPU milliseconds since last server query
   lastSampleTime  = 0L; // Time since last sample.
 
+typedef struct AnalogPin AnalogPin;
+struct AnalogPin {
+  byte pin;
+  int values[NUM_SAMP_PER_MSG];
+  char *name;
+} ;
 
-int irPin = A0;    // select the input pin for the IR sensor
-int usPin = A2;    // select the input pin for the ultrasound sensor
-int irValue = 0;  // infrared sensor value
-int usValue = 0;  // ultrasound sensor value
+AnalogPin *sensors[MAX_SENSORS];
+byte numSensors;
+AnalogPin ir;
+AnalogPin us;
+
+unsigned long timeValues[NUM_SAMP_PER_MSG];
 
 int ledPin = 13;      // select the pin for the LED
 
@@ -122,6 +133,17 @@ void setup(void)
   // declare the ledPin as an OUTPUT:
   pinMode(ledPin, OUTPUT);  
   Serial.println(F("Hello, SEDER!\n")); 
+  
+  // create array of sensors
+  ir.pin = A0;
+  ir.name = "ir";
+  us.pin = A2;
+  us.name = "us";
+  
+  sensors[0] = &ir;
+  sensors[1] = &us;
+  
+  numSensors = 2;
 }
 
 
@@ -132,7 +154,8 @@ void loop(void) {
   // To reduce load on NTP servers, time is polled once per roughly 24 hour period.
   // Otherwise use millis() to estimate time since last query.  Plenty accurate.
   // TODO: write a func and run first time in setup instead of checking sketchTime == 0.
-  if(sketchTime == 0 || millis() - sketchTime > TIME_SERVER_PERIOD) {            // Time's up?
+  // We need condition sampIndex == 0 so lastPolledTime is the same for all values in a message.
+  if(sketchTime == 0 || (millis() - sketchTime > TIME_SERVER_PERIOD) && sampIndex == 0) {            // Time's up?
     unsigned long t  = getTime(); // Query time server
     if(t) {                       // Success?
       lastPolledTime = t;         // Save time
@@ -145,23 +168,83 @@ void loop(void) {
     lastSampleTime = millis();
 
     // Print time.
-    Serial.print(F("Base UNIX time in seconds: "));
-    Serial.println(lastPolledTime);
-    Serial.print(F("Delta UNIX time in milliseconds: "));
-    Serial.println(millis() - sketchTime);
+//    Serial.print(F("Base UNIX time in seconds: "));
+//    Serial.println(lastPolledTime);
+//    Serial.print(F("Delta UNIX time in milliseconds: "));
+//    Serial.println(millis() - sketchTime);
     
-    // read the value from the sensor:
-    irValue = analogRead(irPin);    
-    usValue = analogRead(usPin);    
     
-    // Print values.
-    Serial.print(F("IR Value: "));
-    Serial.print(irValue);
-    Serial.print(F(" US Value: "));
-    Serial.print(usValue);
-    Serial.println("");
+    // read values from sensors
+    for(int i = 0; i < numSensors; i++) {
+      AnalogPin *ap = sensors[i];
+      ap->values[sampIndex] = analogRead(ap->pin);
+//      Serial.print(F("Read sensor: "));
+//      Serial.print(ap->name);
+//      Serial.print(F(" value: "));
+//      Serial.println(ap->values[sampIndex]);
+    }
+    
+    // Update index after reading all values.
+    sampIndex++;
+
+    // check if time to send a message
+    if(sampIndex == NUM_SAMP_PER_MSG) {
+      sampIndex = 0;
+
+      // Send data to server.
+      // TODO
+      Serial.println("*** SEND DATA ***");
+      
+//      Serial.print(F("Delta Times ==> "));
+//      for(int i = 0; i < NUM_SAMP_PER_MSG; i++) {
+//        Serial.print(timeValues[i]);
+//        Serial.print(", ");
+//      }
+//      Serial.println();
+
+      // Time info needed to reconstract the absolute time for each sample.
+      Serial.print(F("Base UNIX time in seconds: ")); // time in secs since epoch
+      Serial.println(lastPolledTime);
+      Serial.print(F("Delta UNIX time in milliseconds: "));
+      Serial.println(millis() - sketchTime); // add this delta to get time for first sample
+      Serial.print(F("Sampling Period in milliseconds: "));
+      Serial.println(SAMP_PERIOD); // add samp period to get time for subsequent samples
+      
+      sendData();
+//      for(int j=0; j < numSensors; j++) {
+//        AnalogPin *ap = sensors[j];
+//        Serial.print(ap->name);
+//        Serial.print(" ==> ");
+//        for(int i = 0; i < NUM_SAMP_PER_MSG; i++) {
+//          Serial.print(ap->values[i]);
+//          Serial.print(", ");
+//        }
+//        Serial.println("");
+//      }
+    }
   }
-  
+}
+
+
+/**************************************************************************/
+/*!
+    @brief  Sends data to server using HTTP.
+
+    @note   
+*/
+/**************************************************************************/
+void sendData(void)
+{
+  for(int j=0; j < numSensors; j++) {
+        AnalogPin *ap = sensors[j];
+        Serial.print(ap->name);
+        Serial.print(" ==> ");
+        for(int i = 0; i < NUM_SAMP_PER_MSG; i++) {
+          Serial.print(ap->values[i]);
+          Serial.print(", ");
+        }
+        Serial.println("");
+  }
 }
 
 
