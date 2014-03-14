@@ -18,8 +18,11 @@
 #include <Adafruit_CC3000.h>
 #include <ccspi.h>
 #include <SPI.h>
+#include <string.h>
 #include "utility/debug.h"
-//#include <string.h>
+#include "DebugUtils.h"
+
+//#define DEBUG_MODE 1
 
 // These are the interrupt and control pins
 #define ADAFRUIT_CC3000_IRQ   3  // MUST be an interrupt pin!
@@ -40,13 +43,44 @@ Adafruit_CC3000 cc3000 = Adafruit_CC3000(ADAFRUIT_CC3000_CS, ADAFRUIT_CC3000_IRQ
 
 #define SEDER_HOST "monster.akualab.com"
 #define SEDER_PORT 3000
-#define SAMP_PERIOD 800 // sampling period in millisec
+#define SAMP_PERIOD 200 // sampling period in millisec
 #define TIME_SERVER_PERIOD 86400000 // period to request time for server in millisec
-#define NUM_SAMP_PER_MSG 5 // number of sample periods between REST messages
-#define MAX_SENSORS 4 // needed to allocate array of sensors (better way?)
 
 #define POST_DATA_ENDPOINT "/v0/data"
-#define MAX_MSG_LEN 300
+
+// We allocate data buffer here to use static allocation. Be careful when changing parameters.
+
+// Header description.
+// TYPE      BYTES     EXAMPLE      DESCRIPTION
+// char[10]   10       123          account id (using ID_SIZE = 10)
+// u long      4       1394413060   base unix time in seconds (lastPolledTime)
+// u long      4       57326        delta time to be added to base time in milliseconds
+// short       2       800          sample period in milliseconds
+// short       2       5            num samples per measurement
+// byte        1       2            num measurements (num analog sensors)
+// TOTAL      23 bytes
+#define ID_SIZE 10   // define it here so we can allocate the buffer at compile time.
+#define HEAD_SIZE 23 // define it here so we can allocate the buffer at compile time.
+// The data is organized as follows:
+// SAMPLE    SENSOR    VALUE
+// 0         0         123
+// 0         1         23
+// 1         0         112
+// 1         1         25
+// ...
+// values are of type short (a short stores a 16-bit (2-byte) value. This yields a range of -32,768 to 32,767)
+// note that the size of int varies for different ATNEL processors and short is always 2 bytes.
+//
+// Sample times can be decoded as follows:
+// SAMPLE   TIME
+// 0        lastPolledTime + (millis() - sketchTime)
+// 1        lastPolledTime + (millis() - sketchTime) * 1000 + 1 * SAMP_PERIOD
+// 2        lastPolledTime + (millis() - sketchTime) * 1000 + 2 * SAMP_PERIOD
+// ...
+#define NUM_SENSORS 2 // number of analog sensors
+#define ANALOG_SIZE 2 // analog value in bytes
+#define NUM_SAMP_PER_MSG 20 // number of sample periods between REST messages
+#define MSG_SIZE NUM_SAMP_PER_MSG * NUM_SENSORS * ANALOG_SIZE + HEAD_SIZE
 
 Adafruit_CC3000_Client client;
 Adafruit_CC3000_Client getClient();
@@ -54,65 +88,63 @@ Adafruit_CC3000_Client getClient();
 //const unsigned long
   //connectTimeout  = 15L * 1000L, // Max time to wait for server connection
   //responseTimeout = 15L * 1000L; // Max time to wait for data from server
-unsigned int
-  sampIndex       = 0;  // current sample index - range is 0 .. NUM_SAMP_PER_MSG - 1
+short sampIndex       = 0;  // current sample index
 unsigned long
   lastPolledTime  = 0L, // Last value retrieved from time server
   sketchTime      = 0L, // CPU milliseconds since last server query
   lastSampleTime  = 0L; // Time since last sample.
 char sederPortStr[5];
-char *crlf = "\r\n";
-struct AnalogPin {
-  byte pin;
-  int values[NUM_SAMP_PER_MSG];
-  char *name;
-} ;
+char accountID[ID_SIZE];
+byte msg[MSG_SIZE];
+char msglen[6]; // msg size encoded as a string (needed for HTTP header) 
+const char * fakeid = "ABCDEFGHIJ";
 
-struct AnalogPin *sensors[MAX_SENSORS];
-byte numSensors;
-struct AnalogPin ir, us;
-void sendData(const char * id, byte nsens, struct AnalogPin **sa, unsigned long t1, 
-  unsigned long t2, unsigned int per, unsigned int nsamp);
+// analog pins in the order they are read.
+// Magnitudes: infrared, ultrasound
+int analogPins[] = {A0,A2}; 
 
-//unsigned long timeValues[NUM_SAMP_PER_MSG];
+//void sendData(const char * id, byte nsens, struct AnalogPin **sa, unsigned long t1, 
+//  unsigned long t2, unsigned int per, unsigned int nsamp);
 
-int ledPin = 13;      // select the pin for the LED
+//int ledPin = 13;      // select the pin for the LED
 
 void setup(void)
 {
+ #if defined DEBUG_MODE
   Serial.begin(115200);
   while (!Serial) {
     ; // wait for serial port to connect. Needed for Leonardo only
   }
-  
-  Serial.print(F("Free RAM: ")); Serial.println(getFreeRam(), DEC);
-  Serial.println(F("Hello, SEDER!\n")); 
+ #endif
+ 
+  DEBUG_PRINT(F("Free RAM: ")); DEBUG_PRINT(getFreeRam());
+  DEBUG_PRINT(F("Hello, SEDER!\n")); 
+  DEBUG_PRINT(F("\nInitialising the CC3000 ..."));
 
   displayDriverMode();
   
-  Serial.println(F("\nInitialising the CC3000 ..."));
   if (!cc3000.begin()) {
-    Serial.println(F("Unable to initialise the CC3000! Check your wiring?"));
+    DEBUG_PRINT(F("Unable to initialise the CC3000! Check your wiring?"));
     for(;;);
   }
 
   uint16_t firmware = checkFirmwareVersion();
   if ((firmware != 0x113) && (firmware != 0x118)) {
-    Serial.println(F("Wrong firmware version!"));
+    PRINT_F("Wrong firmware version!");
     for(;;);
   }
   
   displayMACAddress();
   
-  Serial.println(F("\nDeleting old connection profiles"));
+  DEBUG_PRINT(("\nDeleting old connection profiles\n"));
   if (!cc3000.deleteProfiles()) {
-    Serial.println(F("Failed!"));
+    PRINT_F("Failed!");
     while(1);
   }
 
   /* Attempt to connect to an access point */
   char *ssid = (char *)WLAN_SSID;             /* Max 32 chars */
-  Serial.print(F("\nAttempting to connect to ")); Serial.println(ssid);
+  DEBUG_PRINT(F("Attempting to connect to ")); DEBUG_PRINT(ssid); DEBUG_PRINT(F("\n"));
   
   /* NOTE: Secure connections are not available in 'Tiny' mode! */
   if (!cc3000.connectToAP(WLAN_SSID, WLAN_PASS, WLAN_SECURITY)) {
@@ -135,32 +167,12 @@ void setup(void)
   
   /* Prepare SEDER */
    sprintf(sederPortStr, "%d", SEDER_PORT); // need string for the HTTP header.
-   
-   //strcpy(crlf, (char *)"\r\n");
+   snprintf(msglen, 6, "%d", MSG_SIZE);
+   Serial.print(F("Message size in bytes: ")); Serial.println(msglen);
 
-  // declare the ledPin as an OUTPUT:
-  //(ledPin, OUTPUT);  
-  
-  // create array of sensors
-  ir.pin = A0;
-  ir.name = (char *)"ir"; 
-  us.pin = A2;
-  us.name = (char *)"us";
-  
-  sensors[0] = &ir;
-  sensors[1] = &us;
-  
-  numSensors = 2;
-  if (numSensors > MAX_SENSORS) {
-      Serial.println(F("Num sensors exceed max num sensors."));
-      exit(numSensors);
-  }
-  
-  
   // Initialize TCP client for sending data.
   client = getClient();
 }
-
 
 void loop(void) {
     
@@ -177,14 +189,14 @@ void loop(void) {
     }
   }
   
+  // Read data from sensors.
   if((millis() - lastSampleTime) >= SAMP_PERIOD) {
 
     lastSampleTime = millis();    
     
-    // read values from sensors
-    for(int i = 0; i < numSensors; i++) {
-      AnalogPin *ap = sensors[i];
-      ap->values[sampIndex] = analogRead(ap->pin);
+    for(int i = 0; i < NUM_SENSORS; i++) {
+      writeAnalogValue((short)analogRead(analogPins[i]), sampIndex, i, NUM_SENSORS, msg);
+      //values[sampIndex * NUM_SENSORS + i] = analogRead(analogPins[i]);
     }
     
     // Update index after reading all values.
@@ -196,6 +208,8 @@ void loop(void) {
 
       // Send data to server.
       Serial.println(F("*** SEND DATA ***"));
+      DEBUG_PRINT(F("*** SEND DATA ***"));
+      DEBUG_PRINT(1234);
 
       // Time info needed to reconstract the absolute time for each sample.
       Serial.print(F("Base UNIX time in seconds: ")); // time in secs since epoch
@@ -204,12 +218,32 @@ void loop(void) {
       Serial.println(millis() - sketchTime); // add this delta to get time for first sample
       Serial.print(F("Sampling Period in milliseconds: "));
       Serial.println(SAMP_PERIOD); // add samp period to get time for subsequent samples
+      
+      /// DEBUG
+      Serial.print(F("id bytes: ")); 
+      for (int i = 0; i <10; i++) {
+         Serial.print(fakeid[i], DEC);Serial.print(F(", "));
+      }
+      Serial.println("");
 
-      char id[] = "123";
-      sendData(id, numSensors, sensors, lastPolledTime, millis() - sketchTime, SAMP_PERIOD, NUM_SAMP_PER_MSG);
+      sendData(fakeid, NUM_SENSORS, msg, lastPolledTime, millis() - sketchTime, SAMP_PERIOD, NUM_SAMP_PER_MSG);
     }
   }
 }
+
+// Writes a value to the msg buffer.
+void writeAnalogValue(short val, short sampIndex, byte sensorIndex, byte numSensors, byte *msg) {
+  
+      byte *ptr = msg + HEAD_SIZE + (sampIndex * numSensors + sensorIndex) * sizeof(short);      
+      memcpy(ptr, &val, sizeof(val));
+      Serial.print(F("sampIndex: ")); Serial.print(sampIndex, DEC);
+      Serial.print(F(", sensorIndex: ")); Serial.print(sensorIndex, DEC);
+      Serial.print(F(", val: ")); Serial.print(val, DEC);
+      Serial.print(F(", msg addr start: ")); Serial.print(uint16_t(msg), HEX);
+      Serial.print(F(", msg addr end: ")); Serial.print(uint16_t(msg + MSG_SIZE), HEX);
+      Serial.print(F(", address: ")); Serial.println(uint16_t(ptr), HEX);
+}
+
 
 
 /**************************************************************************/
@@ -239,67 +273,41 @@ void loop(void) {
   
 */
 /**************************************************************************/
-void sendData(char * id, byte nsens, struct AnalogPin **sa, unsigned long t1, 
+void sendData(const char * id, byte nsens, byte *msg, unsigned long t1, 
   unsigned long t2, unsigned int per, unsigned int nsamp)
-{
-  
-  // Print to serial console.
-  for(int j=0; j < numSensors; j++) {
-         struct AnalogPin *ap = sa[j];
-        Serial.print(ap->name);
-        Serial.print(" ==> ");
-        for(int i = 0; i < (int)nsamp; i++) {
-          Serial.print(ap->values[i]);
-          Serial.print(", ");
-        }
-        Serial.println("");
-  }
-  
+{ 
+      Serial.print("*** id[0]: "); Serial.println(id[0], DEC); // DEBUG
+
   Serial.print("Free RAM: "); Serial.println(getFreeRam(), DEC);
 
-  // Prepare JSON message
-  char jm [MAX_MSG_LEN];
-  int cx = 0;
-  cx += snprintf (jm, MAX_MSG_LEN, "{\"id\":\"%s\", \"t1\":%lu, \"t2\":%lu, \"per\":%u, \"nsamp\":%u, \"nmeas\":%hu, \"m\":[",  
-    id,t1,t2,per,nsamp,nsens);
-  Serial.print("MSG Len: "); Serial.println(cx, DEC);
-  
-  for (int j = 0; j < nsens; j++) {
-      struct AnalogPin *ap = sa[j];
-      cx += snprintf (jm+cx, MAX_MSG_LEN-cx, "{\"k\":\"%s\", \"v\":[", ap->name);
-      
-      Serial.print("DEBUG A: "); Serial.println(cx, DEC);
+  // Write msg header. (See documentation at the top of the file.)
+  byte *ptr = msg;      
+  Serial.print(F("Header addr start: ")); Serial.println(uint16_t(ptr), HEX);
+  memcpy(ptr, id, sizeof(accountID));
+  Serial.print(F("val: ")); Serial.print(id); Serial.print(F(", size: ")); Serial.println(sizeof(accountID), DEC);
+    
+    Serial.print("*** ptr[0]: "); Serial.println(ptr[0], DEC); // DEBUG
+    Serial.print("*** msg[0]: "); Serial.println(msg[0], DEC); // DEBUG
 
-      for (int i = 0; i < (int)nsamp; i++) {
-        cx += snprintf (jm+cx, MAX_MSG_LEN-cx, "%d", ap->values[i]);
-              Serial.print("DEBUG B: "); Serial.println(cx, DEC);
+  ptr += sizeof(accountID);
+  memcpy(ptr, &t1, sizeof(t1));
+  Serial.print(F("t1: ")); Serial.print(t1, DEC); Serial.print(F(", size: ")); Serial.println(sizeof(t1), DEC);
+  ptr += sizeof(t1);
+  memcpy(ptr, &t2, sizeof(t2));
+  Serial.print(F("t2: ")); Serial.print(t2, DEC); Serial.print(F(", size: ")); Serial.println(sizeof(t2), DEC);
+  ptr += sizeof(t2);
+  memcpy(ptr, &per, sizeof(per));
+  Serial.print(F("per: ")); Serial.print(per, DEC); Serial.print(F(", size: ")); Serial.println(sizeof(per), DEC);
+  ptr += sizeof(per);
+  memcpy(ptr, &nsamp, sizeof(nsamp));
+  Serial.print(F("nsamp: ")); Serial.print(nsamp, DEC); Serial.print(F(", size: ")); Serial.println(sizeof(nsamp), DEC);
+  ptr += sizeof(nsamp);
+  memcpy(ptr, &nsens, sizeof(nsens));
+  Serial.print(F("nsens: ")); Serial.print(nsens, DEC); Serial.print(F(", size: ")); Serial.println(sizeof(nsens), DEC);
+  ptr += sizeof(nsens);
+  Serial.print(F("Header addr end: ")); Serial.println(uint16_t(ptr), HEX);
 
-        if (i < (int)nsamp-1) 
-          cx += snprintf(jm+cx, MAX_MSG_LEN-cx, ",");
-        else
-          cx += snprintf (jm+cx, MAX_MSG_LEN-cx, "]}");
-      }
-      if (j < nsens-1)
-         cx += snprintf (jm+cx, MAX_MSG_LEN-cx, ",");
-      else
-         cx += snprintf (jm+cx, MAX_MSG_LEN-cx, "]}\n");
-         
-      Serial.print("MSG Len: "); Serial.println(cx, DEC);
-  }
-  
-  //strcpy(jm,"TESTING!! XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"); // DEBUG
-  int length = strlen(jm); 
-
-  // Convert int to char array. Max int is six digits.
-  char msglen[6];
-  snprintf(msglen, 6, "%d", length);
-  
-  Serial.print("Free RAM: "); Serial.println(getFreeRam(), DEC);
-  Serial.print("Data length: ");
-  Serial.println(length);
-  Serial.println(jm);
-
-  while (!client.connected()) {
+ while (!client.connected()) {
     Serial.println("Lost connection to server...trying to reconnect.");
     client = getClient();  
     if (client.connected()) {
@@ -311,22 +319,17 @@ void sendData(char * id, byte nsens, struct AnalogPin **sa, unsigned long t1,
 // Send request (In HTTP 1.1 connection is persistent by default - keep-alive).
   if (client.connected()) {
     
-    unsigned long n_debug;
     Serial.println("Start transmission.");
-    n_debug = client.fastrprint(F("POST ")); client.fastrprint(POST_DATA_ENDPOINT); client.fastrprint(F(" HTTP/1.1")); client.fastrprint(crlf);
-    Serial.print("n debug: "); Serial.println(n_debug, DEC);
+    client.fastrprint(F("POST ")); client.fastrprint(POST_DATA_ENDPOINT); client.fastrprint(F(" HTTP/1.1\r\n"));
+    client.fastrprint(F("Host: ")); client.fastrprint(SEDER_HOST); client.fastrprint(F(":")); client.fastrprint(sederPortStr);
+       client.fastrprint(F("\r\n"));
+    client.fastrprint(F("Content-Length: ")); client.fastrprint(msglen); client.fastrprint("\r\n");
+    client.fastrprint(F("Content-Type: application/octet-stream\r\n"));
+    client.fastrprint(F("User-Agent: SEDER_ARD/1.0\r\n"));
+    client.fastrprint(F("\r\n"));
+    int n = client.write(msg, MSG_SIZE, 0);
+    Serial.print(F("n: ")); Serial.println(n, DEC);
 
-    client.fastrprint(F("Host: ")); client.fastrprint(SEDER_HOST); client.fastrprint(F(":")); client.fastrprint(sederPortStr); client.fastrprint(crlf);
-    client.fastrprint(F("Content-Length: ")); client.fastrprint(msglen); client.fastrprint(crlf);
-    client.fastrprint(F("Content-Type: application/json")); client.fastrprint(crlf);
-    client.fastrprint(F("User-Agent: SEDER_ARD/1.0")); client.fastrprint(crlf);
-    client.fastrprint(crlf);
-    
-    //char strx[10];
-    //strncpy(strx,jm, sizeof(strx));
-    n_debug = client.fastrprint(jm);
-    Serial.print("n debug: "); Serial.println(n_debug, DEC);
-    //client.fastrprint(strx);
   } else {
       Serial.println(F("Connection failed"));    
     return;
@@ -338,6 +341,7 @@ void sendData(char * id, byte nsens, struct AnalogPin **sa, unsigned long t1,
   /* Read data until either the connection is closed, or the idle timeout is reached. */ 
   unsigned long lastRead = millis();
   while (client.connected() && (millis() - lastRead < TIMEOUT)) {
+    // Serial.println(F("Get response..."));    this loop is a waste, can we improve?
     while (client.available()) {
       char c = client.read();
       Serial.print(c);
