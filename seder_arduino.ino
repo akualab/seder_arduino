@@ -1,7 +1,18 @@
 /***************************************************
+  SEDER Arduino Client
+  Copyright AKUALAB INC. 2014
+  
+  NOTES:
+  The cc3k hangs up after sending a few data batches. 
+  discussions:
+  
+  change SPI clock:
+  http://forums.adafruit.com/viewtopic.php?f=22&t=49074#p247907
+  
+  http://www.adafruit.com/forums/viewtopic.php?f=22&t=49722
+  https://community.spark.io/t/bug-bounty-kill-the-cyan-flash-of-death/1322/398
 
-
-  WiFi code adapted from the Adafruit CC3000 Wifi Breakout & Shield
+  WiFi code adapted from the Adafruit. See notice below:
 
   Designed specifically to work with the Adafruit WiFi products:
   ----> https://www.adafruit.com/products/1469
@@ -22,8 +33,6 @@
 #include "utility/debug.h"
 #include "DebugUtils.h"
 
-//#define DEBUG_MODE 1
-
 // These are the interrupt and control pins
 #define ADAFRUIT_CC3000_IRQ   3  // MUST be an interrupt pin!
 // These can be any two pins
@@ -32,7 +41,8 @@
 // Use hardware SPI for the remaining pins
 // On an UNO, SCK = 13, MISO = 12, and MOSI = 11
 Adafruit_CC3000 cc3000 = Adafruit_CC3000(ADAFRUIT_CC3000_CS, ADAFRUIT_CC3000_IRQ, ADAFRUIT_CC3000_VBAT,
-                                         SPI_CLOCK_DIVIDER); // you can change this clock speed but DI
+                                         SPI_CLOCK_DIV2); // changed by leo as per forum suggestion.
+                                         //SPI_CLOCK_DIVIDER); // you can change this clock speed but DI
 
 #define WLAN_SSID       "lunas"        // cannot be longer than 32 characters!
 #define WLAN_PASS       "ohigginssucre"
@@ -40,11 +50,12 @@ Adafruit_CC3000 cc3000 = Adafruit_CC3000(ADAFRUIT_CC3000_CS, ADAFRUIT_CC3000_IRQ
 #define WLAN_SECURITY   WLAN_SEC_WPA2
 
 #define TIMEOUT  3000
+#define RESPONSE_TIMEOUT  1000
 
 #define SEDER_HOST "monster.akualab.com"
 #define SEDER_PORT 3000
-#define SAMP_PERIOD 200 // sampling period in millisec
-#define TIME_SERVER_PERIOD 86400000 // period to request time for server in millisec
+#define SAMP_PERIOD 200L // sampling period in millisec
+#define TIME_SERVER_PERIOD 86400000L // period to request time for server in millisec
 
 #define POST_DATA_ENDPOINT "/v0/data"
 
@@ -52,15 +63,17 @@ Adafruit_CC3000 cc3000 = Adafruit_CC3000(ADAFRUIT_CC3000_CS, ADAFRUIT_CC3000_IRQ
 
 // Header description.
 // TYPE      BYTES     EXAMPLE      DESCRIPTION
-// char[10]   10       123          account id (using ID_SIZE = 10)
+// char[10]   10       ABCDEFGHIJ   account id (using ACCT_ID_SIZE = 10)
+// char[10]   10       0123456789   device ID (using DEVICE_ID_SIZE = 10)
 // u long      4       1394413060   base unix time in seconds (lastPolledTime)
 // u long      4       57326        delta time to be added to base time in milliseconds
 // short       2       800          sample period in milliseconds
 // short       2       5            num samples per measurement
 // byte        1       2            num measurements (num analog sensors)
-// TOTAL      23 bytes
-#define ID_SIZE 10   // define it here so we can allocate the buffer at compile time.
-#define HEAD_SIZE 23 // define it here so we can allocate the buffer at compile time.
+// TOTAL      33 bytes
+#define ACCT_ID_SIZE 10   // define it here so we can allocate the buffer at compile time.
+#define DEVICE_ID_SIZE 10   // define it here so we can allocate the buffer at compile time.
+#define HEAD_SIZE 33 // define it here so we can allocate the buffer at compile time.
 // The data is organized as follows:
 // SAMPLE    SENSOR    VALUE
 // 0         0         123
@@ -71,16 +84,17 @@ Adafruit_CC3000 cc3000 = Adafruit_CC3000(ADAFRUIT_CC3000_CS, ADAFRUIT_CC3000_IRQ
 // values are of type short (a short stores a 16-bit (2-byte) value. This yields a range of -32,768 to 32,767)
 // note that the size of int varies for different ATNEL processors and short is always 2 bytes.
 //
-// Sample times can be decoded as follows:
+// Sample times can be decoded to msec as follows:
 // SAMPLE   TIME
-// 0        lastPolledTime + (millis() - sketchTime)
-// 1        lastPolledTime + (millis() - sketchTime) * 1000 + 1 * SAMP_PERIOD
-// 2        lastPolledTime + (millis() - sketchTime) * 1000 + 2 * SAMP_PERIOD
+// 0        lastPolledTime * 1000 + (millis() - sketchTime)
+// 1        lastPolledTime * 1000 + (millis() - sketchTime) + 1 * SAMP_PERIOD
+// 2        lastPolledTime * 1000 + (millis() - sketchTime) + 2 * SAMP_PERIOD
 // ...
 #define NUM_SENSORS 2 // number of analog sensors
 #define ANALOG_SIZE 2 // analog value in bytes
-#define NUM_SAMP_PER_MSG 20 // number of sample periods between REST messages
+#define NUM_SAMP_PER_MSG 80L // number of sample periods between REST messages
 #define MSG_SIZE NUM_SAMP_PER_MSG * NUM_SENSORS * ANALOG_SIZE + HEAD_SIZE
+#define CHUNK_SIZE 20L
 
 Adafruit_CC3000_Client client;
 Adafruit_CC3000_Client getClient();
@@ -94,99 +108,120 @@ unsigned long
   sketchTime      = 0L, // CPU milliseconds since last server query
   lastSampleTime  = 0L; // Time since last sample.
 char sederPortStr[5];
-char accountID[ID_SIZE];
+char accountID[ACCT_ID_SIZE];
+char deviceID[DEVICE_ID_SIZE];
 byte msg[MSG_SIZE];
 char msglen[6]; // msg size encoded as a string (needed for HTTP header) 
-const char * fakeid = "ABCDEFGHIJ";
+int msgSize = MSG_SIZE;
+int chunkSize = CHUNK_SIZE;
+int numChunks = msgSize/chunkSize;
 
 // analog pins in the order they are read.
 // Magnitudes: infrared, ultrasound
 int analogPins[] = {A0,A2}; 
+int ledPin = 13;      // select the pin for the LED
 
-//void sendData(const char * id, byte nsens, struct AnalogPin **sa, unsigned long t1, 
-//  unsigned long t2, unsigned int per, unsigned int nsamp);
+void(* resetFunc) (void) = 0; //declare reset function @ address 0
 
-//int ledPin = 13;      // select the pin for the LED
+/*************************************
 
+   SETUP
+
+
+*************************************/
 void setup(void)
 {
- #if defined DEBUG_MODE
+ int k;
+ #ifdef SERIAL_DEBUG_ENABLED > 0
   Serial.begin(115200);
   while (!Serial) {
     ; // wait for serial port to connect. Needed for Leonardo only
   }
  #endif
  
-  DEBUG_PRINT(F("Free RAM: ")); DEBUG_PRINT(getFreeRam());
-  DEBUG_PRINT(F("Hello, SEDER!\n")); 
-  DEBUG_PRINT(F("\nInitialising the CC3000 ..."));
+  DebugPrintln(F("\n\nHello, SEDER!\n")); 
+  DebugPrint(F("Free RAM: ")); DebugPrintln(getFreeRam());
+  DebugPrintln(F("\nInitialising the CC3000 ..."));
 
   displayDriverMode();
   
-  if (!cc3000.begin()) {
-    DEBUG_PRINT(F("Unable to initialise the CC3000! Check your wiring?"));
-    for(;;);
+  for (k = 0; !cc3000.begin(); k++) {
+    DebugPrintln(F("Unable to initialise the CC3000!"));
+    delay(delayForIteration(k));
   }
 
   uint16_t firmware = checkFirmwareVersion();
   if ((firmware != 0x113) && (firmware != 0x118)) {
-    PRINT_F("Wrong firmware version!");
+    DebugPrintln(F("Wrong firmware version!"));
     for(;;);
   }
   
   displayMACAddress();
   
-  DEBUG_PRINT(("\nDeleting old connection profiles\n"));
-  if (!cc3000.deleteProfiles()) {
-    PRINT_F("Failed!");
-    while(1);
+  DebugPrintln(F("Deleting old connection profiles"));
+  for (k=0;!cc3000.deleteProfiles();k++) {
+    DebugPrintln("Can't delete old profile!...retrying");
+    delay(delayForIteration(k));
   }
 
   /* Attempt to connect to an access point */
   char *ssid = (char *)WLAN_SSID;             /* Max 32 chars */
-  DEBUG_PRINT(F("Attempting to connect to ")); DEBUG_PRINT(ssid); DEBUG_PRINT(F("\n"));
+  DebugPrint(F("Attempting to connect to ")); DebugPrintln(ssid);
   
   /* NOTE: Secure connections are not available in 'Tiny' mode! */
-  if (!cc3000.connectToAP(WLAN_SSID, WLAN_PASS, WLAN_SECURITY)) {
-    Serial.println(F("Failed!"));
-    while(1);
+  for (k=0;!cc3000.connectToAP(WLAN_SSID, WLAN_PASS, WLAN_SECURITY);k++) {
+    DebugPrintln(F("Failed to connect!...retrying"));
+    delay(delayForIteration(k));
   }
-   
-  Serial.println(F("Connected!"));
+  DebugPrintln(F("Connected!"));
   
   /* Wait for DHCP to complete */
-  Serial.println(F("Request DHCP"));
-  while (!cc3000.checkDHCP()) {
-    delay(100); // ToDo: Insert a DHCP timeout!
+  DebugPrintln(F("Request DHCP"));
+  for (k=0;!cc3000.checkDHCP();k++) {
+    DebugPrintln(F("Retrying...")); 
+    delay(delayForIteration(k));
   }
 
   /* Display the IP address DNS, Gateway, etc. */  
-  while (!displayConnectionDetails()) {
-    delay(1000);
+  for (k=0;!displayConnectionDetails();k++) {
+    DebugPrintln(F("Failed to display connection details!...retrying"));
+    delay(delayForIteration(k));
   }
   
   /* Prepare SEDER */
    sprintf(sederPortStr, "%d", SEDER_PORT); // need string for the HTTP header.
    snprintf(msglen, 6, "%d", MSG_SIZE);
-   Serial.print(F("Message size in bytes: ")); Serial.println(msglen);
+   DebugPrint(F("Message size in bytes: ")); DebugPrintln(msglen);
+   
+   // Use some fake IDs for now.
+   char *x = "ABCDEFGHIJ";
+   memccpy (accountID, x, 1, ACCT_ID_SIZE);
+   char *y = "0000000001";
+   memccpy (deviceID, y, 1, DEVICE_ID_SIZE);
 
   // Initialize TCP client for sending data.
   client = getClient();
 }
 
 void loop(void) {
-    
+
   // To reduce load on NTP servers, time is polled once per roughly 24 hour period.
   // Otherwise use millis() to estimate time since last query.  Plenty accurate.
-  // TODO: write a func and run first time in setup instead of checking sketchTime == 0.
   // We need condition sampIndex == 0 so lastPolledTime is the same for all values in a message.
-  if(sketchTime == 0 || ((millis() - sketchTime > TIME_SERVER_PERIOD) && sampIndex == 0)) {            // Time's up?
-    //unsigned long t  = getTime(); // Query time server
-    unsigned long t  = 111111L; // MOCK FOR TESTING REMEMBER TO CHANGE -- DEBUG
+  for(int k=0;sketchTime == 0 || ((millis() - sketchTime > TIME_SERVER_PERIOD) && sampIndex == 0);k++) {            // Time's up?
+    unsigned long t;
+    //#ifdef SERIAL_DEBUG_ENABLED > 0
+      //t  = 111111L; // MOCK FOR TESTING REMEMBER TO CHANGE -- DEBUG
+    //#else
+      t  = getTime(); // Query time server
+    //#endif
     if(t) {                       // Success?
       lastPolledTime = t;         // Save time
       sketchTime     = millis();  // Save sketch time of last valid time query
-    }
+      break;
+    } else {
+        delay(delayForIteration(k));
+    } 
   }
   
   // Read data from sensors.
@@ -196,7 +231,6 @@ void loop(void) {
     
     for(int i = 0; i < NUM_SENSORS; i++) {
       writeAnalogValue((short)analogRead(analogPins[i]), sampIndex, i, NUM_SENSORS, msg);
-      //values[sampIndex * NUM_SENSORS + i] = analogRead(analogPins[i]);
     }
     
     // Update index after reading all values.
@@ -207,26 +241,18 @@ void loop(void) {
       sampIndex = 0;
 
       // Send data to server.
-      Serial.println(F("*** SEND DATA ***"));
-      DEBUG_PRINT(F("*** SEND DATA ***"));
-      DEBUG_PRINT(1234);
+      DebugPrintln(F("*** SEND DATA ***"));
 
       // Time info needed to reconstract the absolute time for each sample.
-      Serial.print(F("Base UNIX time in seconds: ")); // time in secs since epoch
-      Serial.println(lastPolledTime);
-      Serial.print(F("Delta UNIX time in milliseconds: "));
-      Serial.println(millis() - sketchTime); // add this delta to get time for first sample
-      Serial.print(F("Sampling Period in milliseconds: "));
-      Serial.println(SAMP_PERIOD); // add samp period to get time for subsequent samples
-      
-      /// DEBUG
-      Serial.print(F("id bytes: ")); 
-      for (int i = 0; i <10; i++) {
-         Serial.print(fakeid[i], DEC);Serial.print(F(", "));
-      }
-      Serial.println("");
+      DebugPrint(F("Base UNIX time in seconds: ")); // time in secs since epoch
+      DebugPrintln(lastPolledTime);
+      DebugPrint(F("Delta UNIX time in milliseconds: "));
+      DebugPrintln(millis() - sketchTime); // add this delta to get time for first sample
+      DebugPrint(F("Sampling Period in milliseconds: "));
+      DebugPrintln(SAMP_PERIOD); // add samp period to get time for subsequent samples
 
-      sendData(fakeid, NUM_SENSORS, msg, lastPolledTime, millis() - sketchTime, SAMP_PERIOD, NUM_SAMP_PER_MSG);
+      //sendData(fakeid, NUM_SENSORS, msg, lastPolledTime, millis() - sketchTime, SAMP_PERIOD, NUM_SAMP_PER_MSG);
+      sendData();
     }
   }
 }
@@ -236,12 +262,12 @@ void writeAnalogValue(short val, short sampIndex, byte sensorIndex, byte numSens
   
       byte *ptr = msg + HEAD_SIZE + (sampIndex * numSensors + sensorIndex) * sizeof(short);      
       memcpy(ptr, &val, sizeof(val));
-      Serial.print(F("sampIndex: ")); Serial.print(sampIndex, DEC);
-      Serial.print(F(", sensorIndex: ")); Serial.print(sensorIndex, DEC);
-      Serial.print(F(", val: ")); Serial.print(val, DEC);
-      Serial.print(F(", msg addr start: ")); Serial.print(uint16_t(msg), HEX);
-      Serial.print(F(", msg addr end: ")); Serial.print(uint16_t(msg + MSG_SIZE), HEX);
-      Serial.print(F(", address: ")); Serial.println(uint16_t(ptr), HEX);
+//      DebugPrint(F("sampIndex: ")); DebugPrint(sampIndex, DEC);
+//      DebugPrint(F(", sensorIndex: ")); DebugPrint(sensorIndex, DEC);
+//      DebugPrint(F(", val: ")); DebugPrint(val, DEC);
+//      DebugPrint(F(", msg addr start: ")); DebugPrint(uint16_t(msg), HEX);
+//      DebugPrint(F(", msg addr end: ")); DebugPrint(uint16_t(msg + MSG_SIZE), HEX);
+//      DebugPrint(F(", address: ")); DebugPrintln(uint16_t(ptr), HEX);
 }
 
 
@@ -273,53 +299,50 @@ void writeAnalogValue(short val, short sampIndex, byte sensorIndex, byte numSens
   
 */
 /**************************************************************************/
-void sendData(const char * id, byte nsens, byte *msg, unsigned long t1, 
-  unsigned long t2, unsigned int per, unsigned int nsamp)
-{ 
-      Serial.print("*** id[0]: "); Serial.println(id[0], DEC); // DEBUG
-
-  Serial.print("Free RAM: "); Serial.println(getFreeRam(), DEC);
+boolean sendData() { 
+  byte nsens = NUM_SENSORS;
+  unsigned long t1 = lastPolledTime;
+  unsigned long t2 = millis() - sketchTime;
+  unsigned int per = SAMP_PERIOD;
+  unsigned int nsamp = NUM_SAMP_PER_MSG;
+    
+  DebugPrint("Free RAM: "); DebugPrintln(getFreeRam(), DEC);
 
   // Write msg header. (See documentation at the top of the file.)
   byte *ptr = msg;      
-  Serial.print(F("Header addr start: ")); Serial.println(uint16_t(ptr), HEX);
-  memcpy(ptr, id, sizeof(accountID));
-  Serial.print(F("val: ")); Serial.print(id); Serial.print(F(", size: ")); Serial.println(sizeof(accountID), DEC);
-    
-    Serial.print("*** ptr[0]: "); Serial.println(ptr[0], DEC); // DEBUG
-    Serial.print("*** msg[0]: "); Serial.println(msg[0], DEC); // DEBUG
-
+  DebugPrint(F("Header addr start: ")); DebugPrintln(uint16_t(ptr), HEX);
+  memcpy(ptr, accountID, sizeof(accountID));
   ptr += sizeof(accountID);
+  memcpy(ptr, deviceID, sizeof(deviceID));
+  ptr += sizeof(deviceID);
   memcpy(ptr, &t1, sizeof(t1));
-  Serial.print(F("t1: ")); Serial.print(t1, DEC); Serial.print(F(", size: ")); Serial.println(sizeof(t1), DEC);
   ptr += sizeof(t1);
   memcpy(ptr, &t2, sizeof(t2));
-  Serial.print(F("t2: ")); Serial.print(t2, DEC); Serial.print(F(", size: ")); Serial.println(sizeof(t2), DEC);
   ptr += sizeof(t2);
   memcpy(ptr, &per, sizeof(per));
-  Serial.print(F("per: ")); Serial.print(per, DEC); Serial.print(F(", size: ")); Serial.println(sizeof(per), DEC);
   ptr += sizeof(per);
   memcpy(ptr, &nsamp, sizeof(nsamp));
-  Serial.print(F("nsamp: ")); Serial.print(nsamp, DEC); Serial.print(F(", size: ")); Serial.println(sizeof(nsamp), DEC);
   ptr += sizeof(nsamp);
   memcpy(ptr, &nsens, sizeof(nsens));
-  Serial.print(F("nsens: ")); Serial.print(nsens, DEC); Serial.print(F(", size: ")); Serial.println(sizeof(nsens), DEC);
   ptr += sizeof(nsens);
-  Serial.print(F("Header addr end: ")); Serial.println(uint16_t(ptr), HEX);
+  DebugPrint(F("Header addr end: ")); DebugPrintln(uint16_t(ptr), HEX);
 
- while (!client.connected()) {
-    Serial.println("Lost connection to server...trying to reconnect.");
+ for (int k=0;!client.connected();k++) {
+    DebugPrintln(F("client is not connected...connecting"));
     client = getClient();  
     if (client.connected()) {
       break;
     }
-    delay(1000);
+    delay(delayForIteration(k));
   }
+
+  DebugPrint(F("Free RAM: ")); DebugPrintln(getFreeRam());
 
 // Send request (In HTTP 1.1 connection is persistent by default - keep-alive).
   if (client.connected()) {
     
-    Serial.println("Start transmission.");
+    int n;
+    DebugPrintln("Start transmission.");
     client.fastrprint(F("POST ")); client.fastrprint(POST_DATA_ENDPOINT); client.fastrprint(F(" HTTP/1.1\r\n"));
     client.fastrprint(F("Host: ")); client.fastrprint(SEDER_HOST); client.fastrprint(F(":")); client.fastrprint(sederPortStr);
        client.fastrprint(F("\r\n"));
@@ -327,28 +350,59 @@ void sendData(const char * id, byte nsens, byte *msg, unsigned long t1,
     client.fastrprint(F("Content-Type: application/octet-stream\r\n"));
     client.fastrprint(F("User-Agent: SEDER_ARD/1.0\r\n"));
     client.fastrprint(F("\r\n"));
-    int n = client.write(msg, MSG_SIZE, 0);
-    Serial.print(F("n: ")); Serial.println(n, DEC);
-
-  } else {
-      Serial.println(F("Connection failed"));    
-    return;
-  }
-
-  // Print response.  
-  Serial.println(F("-------------------------------------"));
-
-  /* Read data until either the connection is closed, or the idle timeout is reached. */ 
-  unsigned long lastRead = millis();
-  while (client.connected() && (millis() - lastRead < TIMEOUT)) {
-    // Serial.println(F("Get response..."));    this loop is a waste, can we improve?
-    while (client.available()) {
-      char c = client.read();
-      Serial.print(c);
-      lastRead = millis();
+    delay(5); // workaround to give cc3k time to catch up.
+    
+    int i =0;
+    for (;i<numChunks;i++) {
+      client.write(msg + i * chunkSize, chunkSize, 0);
+      delay(5);
     }
+    client.write(msg + i * chunkSize, msgSize % chunkSize, 0);
+
+    //client.write(msg, MSG_SIZE, 0);
+
+    // Handle responses.
+    // For now, when response fails, we continue. In the future we must put data in a FIFO queue and
+    // use a separate thread to send out data from the queue. 
+    unsigned long ts;
+    #ifdef SERIAL_DEBUG_ENABLED > 0
+    ts = millis();
+    #endif
+    DebugPrint(F("OK\r\nAwaiting response..."));
+    int c = 0;
+    // Wait for char '!' in response.
+    while(((c = timedRead()) > 0) && (c != '!'));
+    if(c == '!')  { 
+       DebugPrintln(F("success!"));
+    } else if(c < 0) {
+       DebugPrintln(F("timeout"));
+    } else {
+      DebugPrintln(F("error: invalid response"));
+    }
+    int32_t r = client.close();
+    DebugPrint(F("close() returned: ")); DebugPrintln(r);
+    DebugPrint(F("response time in millisec: ")); DebugPrintln(millis() - ts);
+    return (c == '!');
+    
+  } else {
+      DebugPrintln(F("Connection failed"));    
+    return false;
   }
-  Serial.println(F("-------------------------------------"));
+  
+  // Print response.  
+//  DebugPrintln(F("-------------------------------------"));
+//
+//  /* Read data until either the connection is closed, or the idle timeout is reached. */ 
+//  unsigned long lastRead = millis();
+//  while (client.connected() && (millis() - lastRead < RESPONSE_TIMEOUT)) {
+//    // DebugPrintln(F("Get response..."));    this loop is a waste, can we improve?
+//    while (client.available()) {
+//      char c = client.read();
+//      DebugPrint(c);
+//      lastRead = millis();
+//    }
+//  }
+//  DebugPrintln(F("-------------------------------------"));
   
   // Not calling client.close() and cc3000.disconnect() to keep the connection open between requests. 
   // If the server disconnects, a new client will be created before sending a request.
@@ -358,12 +412,18 @@ Adafruit_CC3000_Client getClient() {
   
   // Get the website IP & print it
   uint32_t ip = 0;
-  Serial.print(SEDER_HOST); Serial.print(F(" -> "));
-  while (ip == 0) {
+  DebugPrint(SEDER_HOST); DebugPrint(F(" -> "));
+  for (int k=0;ip == 0;k++) {
     if (! cc3000.getHostByName((char *)SEDER_HOST, &ip)) {
-      Serial.println(F("Couldn't resolve!"));
-    }
-    delay(500); // needed?? TODO
+      DebugPrintln(F("Couldn't resolve! Retrying... "));
+      unsigned long d = delayForIteration(k);
+      delay(d);
+      if (d >= 192000) {
+         // give up.
+         cc3000.reboot();
+         resetFunc();
+      }
+    } 
   }
   cc3000.printIPdotsRev(ip);
   
@@ -384,14 +444,14 @@ Adafruit_CC3000_Client getClient() {
 void displayDriverMode(void)
 {
   #ifdef CC3000_TINY_DRIVER
-    Serial.println(F("CC3000 is configure in 'Tiny' mode"));
+    DebugPrintln(F("CC3000 is configure in 'Tiny' mode"));
   #else
-    Serial.print(F("RX Buffer : "));
-    Serial.print(CC3000_RX_BUFFER_SIZE);
-    Serial.println(F(" bytes"));
-    Serial.print(F("TX Buffer : "));
-    Serial.print(CC3000_TX_BUFFER_SIZE);
-    Serial.println(F(" bytes"));
+    DebugPrint(F("RX Buffer : "));
+    DebugPrint(CC3000_RX_BUFFER_SIZE);
+    DebugPrintln(F(" bytes"));
+    DebugPrint(F("TX Buffer : "));
+    DebugPrint(CC3000_TX_BUFFER_SIZE);
+    DebugPrintln(F(" bytes"));
   #endif
 }
 
@@ -408,13 +468,13 @@ uint16_t checkFirmwareVersion(void)
 #ifndef CC3000_TINY_DRIVER  
   if(!cc3000.getFirmwareVersion(&major, &minor))
   {
-    Serial.println(F("Unable to retrieve the firmware version!\r\n"));
+    DebugPrintln(F("Unable to retrieve the firmware version!\r\n"));
     version = 0;
   }
   else
   {
-    Serial.print(F("Firmware V. : "));
-    Serial.print(major); Serial.print(F(".")); Serial.println(minor);
+    DebugPrint(F("Firmware V. : "));
+    DebugPrint(major); DebugPrint(F(".")); DebugPrintln(minor);
     version = major; version <<= 8; version |= minor;
   }
 #endif
@@ -432,11 +492,11 @@ void displayMACAddress(void)
   
   if(!cc3000.getMacAddress(macAddress))
   {
-    Serial.println(F("Unable to retrieve MAC Address!\r\n"));
+    DebugPrintln(F("Unable to retrieve MAC Address!\r\n"));
   }
   else
   {
-    Serial.print(F("MAC Address : "));
+    DebugPrint(F("MAC Address : "));
     cc3000.printHex((byte*)&macAddress, 6);
   }
 }
@@ -453,17 +513,17 @@ bool displayConnectionDetails(void)
   
   if(!cc3000.getIPAddress(&ipAddress, &netmask, &gateway, &dhcpserv, &dnsserv))
   {
-    Serial.println(F("Unable to retrieve the IP Address!\r\n"));
+    DebugPrintln(F("Unable to retrieve the IP Address!\r\n"));
     return false;
   }
   else
   {
-    Serial.print(F("\nIP Addr: ")); cc3000.printIPdotsRev(ipAddress);
-    Serial.print(F("\nNetmask: ")); cc3000.printIPdotsRev(netmask);
-    Serial.print(F("\nGateway: ")); cc3000.printIPdotsRev(gateway);
-    Serial.print(F("\nDHCPsrv: ")); cc3000.printIPdotsRev(dhcpserv);
-    Serial.print(F("\nDNSserv: ")); cc3000.printIPdotsRev(dnsserv);
-    Serial.println();
+    DebugPrint(F("\nIP Addr: ")); cc3000.printIPdotsRev(ipAddress);
+    DebugPrint(F("\nNetmask: ")); cc3000.printIPdotsRev(netmask);
+    DebugPrint(F("\nGateway: ")); cc3000.printIPdotsRev(gateway);
+    DebugPrint(F("\nDHCPsrv: ")); cc3000.printIPdotsRev(dhcpserv);
+    DebugPrint(F("\nDNSserv: ")); cc3000.printIPdotsRev(dnsserv);
+    DebugPrintln();
     return true;
   }
 }
@@ -476,7 +536,7 @@ unsigned long getTime(void) {
   uint8_t       buf[48];
   unsigned long ip, startTime, t = 0L;
 
-  Serial.print(F("Locating time server..."));
+  DebugPrint(F("Locating time server..."));
 
   // Hostname to IP lookup; use NTP pool (rotates through servers)
   if(cc3000.getHostByName((char *)"pool.ntp.org", &ip)) {
@@ -484,7 +544,7 @@ unsigned long getTime(void) {
       timeReqA[] = { 227,  0,  6, 236 },
       timeReqB[] = {  49, 78, 49,  52 };
 
-    Serial.println(F("\r\nAttempting connection..."));
+    DebugPrintln(F("\r\nAttempting connection..."));
     startTime = millis();
     do {
       gt = cc3000.connectUDP(ip, 123);
@@ -492,7 +552,7 @@ unsigned long getTime(void) {
             ((millis() - startTime) < TIMEOUT));
 
     if(gt.connected()) {
-      Serial.print(F("connected!\r\nIssuing request..."));
+      DebugPrint(F("connected!\r\nIssuing request..."));
 
       // Assemble and issue request packet
       memset(buf, 0, sizeof(buf));
@@ -500,7 +560,7 @@ unsigned long getTime(void) {
       memcpy_P(&buf[12], timeReqB, sizeof(timeReqB));
       gt.write(buf, sizeof(buf));
 
-      Serial.print(F("\r\nAwaiting response..."));
+      DebugPrint(F("\r\nAwaiting response..."));
       memset(buf, 0, sizeof(buf));
       startTime = millis();
       while((!gt.available()) &&
@@ -511,11 +571,36 @@ unsigned long getTime(void) {
              ((unsigned long)buf[41] << 16) |
              ((unsigned long)buf[42] <<  8) |
               (unsigned long)buf[43]) - 2208988800UL;
-        Serial.print(F("OK\r\n"));
+        DebugPrint(F("OK\r\n"));
       }
       gt.close();
     }
   }
-  if(!t) Serial.println(F("error"));
+  if(!t) DebugPrintln(F("error"));
   return t;
+}
+
+// Read from client stream with a 5 second timeout.  Although an
+// essentially identical method already exists in the Stream() class,
+// it's declared private there...so this is a local copy.
+int timedRead(void) {
+  unsigned long start = millis();
+  while((!client.available()) && ((millis() - start) < RESPONSE_TIMEOUT));
+  return client.read();  // -1 on timeout
+}
+
+// Controls how long to wait before retrying an action based on number
+// tries. Initally it doubles teh delay for each iteration. After 6 tries
+// it stops increasing the delay.
+unsigned long delayForIteration(int iter) {
+  unsigned long d = 1;
+  if (iter < 7) {
+     for (int i = 0; i <iter; i++) {
+       d = d * 2;
+     }
+  } else {
+     d = 64; 
+  }
+  DebugPrint(F("wait before retry in millisecs: "));DebugPrintln(d * TIMEOUT);
+  return d * TIMEOUT;
 }
