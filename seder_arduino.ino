@@ -4,13 +4,18 @@
   
   NOTES:
   The cc3k hangs up after sending a few data batches. 
-  discussions:
+  I had to change the SPI clock and send the message in small batches
+  with a 5 ms delay between batches. I'm also using the timer watchdog 
+  to monitor http responses because it hangs sometimes.
+  
+  ref:
   
   change SPI clock:
   http://forums.adafruit.com/viewtopic.php?f=22&t=49074#p247907
   
   http://www.adafruit.com/forums/viewtopic.php?f=22&t=49722
   https://community.spark.io/t/bug-bounty-kill-the-cyan-flash-of-death/1322/398
+
 
   WiFi code adapted from the Adafruit. See notice below:
 
@@ -30,6 +35,7 @@
 #include <ccspi.h>
 #include <SPI.h>
 #include <string.h>
+#include <avr/wdt.h>
 #include "utility/debug.h"
 #include "DebugUtils.h"
 
@@ -55,9 +61,11 @@ Adafruit_CC3000 cc3000 = Adafruit_CC3000(ADAFRUIT_CC3000_CS, ADAFRUIT_CC3000_IRQ
 #define SEDER_HOST "monster.akualab.com"
 #define SEDER_PORT 3000
 #define SAMP_PERIOD 200L // sampling period in millisec
-#define TIME_SERVER_PERIOD 86400000L // period to request time for server in millisec
+#define TIME_SERVER_PERIOD 43200000L // period to request time for server in millisec
 
 #define POST_DATA_ENDPOINT "/v0/data"
+#define POST_LOG_ENDPOINT "/v0/log"
+#define USER_AGENT "User-Agent: SEDER_ARD/1.0\r\n"
 
 // We allocate data buffer here to use static allocation. Be careful when changing parameters.
 
@@ -123,12 +131,11 @@ int ledPin = 13;      // select the pin for the LED
 
 void(* resetFunc) (void) = 0; //declare reset function @ address 0
 
-/*************************************
-
-   SETUP
-
-
-*************************************/
+/************************************\
+*
+*   SETUP
+*
+\************************************/
 void setup(void)
 {
  int k;
@@ -138,6 +145,9 @@ void setup(void)
     ; // wait for serial port to connect. Needed for Leonardo only
   }
  #endif
+ 
+  // Enable watchdog timer.
+  //wdt_enable(WDTO_8S);
  
   DebugPrintln(F("\n\nHello, SEDER!\n")); 
   DebugPrint(F("Free RAM: ")); DebugPrintln(getFreeRam());
@@ -149,7 +159,8 @@ void setup(void)
     DebugPrintln(F("Unable to initialise the CC3000!"));
     delay(delayForIteration(k));
   }
-
+  wdt_reset(); // reset watchdog timer.
+  
   uint16_t firmware = checkFirmwareVersion();
   if ((firmware != 0x113) && (firmware != 0x118)) {
     DebugPrintln(F("Wrong firmware version!"));
@@ -174,6 +185,7 @@ void setup(void)
     delay(delayForIteration(k));
   }
   DebugPrintln(F("Connected!"));
+  wdt_reset(); // reset watchdog timer.
   
   /* Wait for DHCP to complete */
   DebugPrintln(F("Request DHCP"));
@@ -181,6 +193,8 @@ void setup(void)
     DebugPrintln(F("Retrying...")); 
     delay(delayForIteration(k));
   }
+  wdt_reset(); // reset watchdog timer.
+
 
   /* Display the IP address DNS, Gateway, etc. */  
   for (k=0;!displayConnectionDetails();k++) {
@@ -201,8 +215,16 @@ void setup(void)
 
   // Initialize TCP client for sending data.
   client = getClient();
+  lastPolledTime = sendLog("SEDER setup done.");
+  if (lastPolledTime) sketchTime = millis();
+  DebugPrint(F("Server time: ")); DebugPrintln(lastPolledTime);
 }
 
+/************************************\
+*
+*   LOOP
+*
+\************************************/
 void loop(void) {
 
   // To reduce load on NTP servers, time is polled once per roughly 24 hour period.
@@ -210,17 +232,16 @@ void loop(void) {
   // We need condition sampIndex == 0 so lastPolledTime is the same for all values in a message.
   for(int k=0;sketchTime == 0 || ((millis() - sketchTime > TIME_SERVER_PERIOD) && sampIndex == 0);k++) {            // Time's up?
     unsigned long t;
+    wdt_reset(); // reset watchdog timer.
+
     //#ifdef SERIAL_DEBUG_ENABLED > 0
       //t  = 111111L; // MOCK FOR TESTING REMEMBER TO CHANGE -- DEBUG
     //#else
-      t  = getTime(); // Query time server
+      t  = sendLog("update time.");
     //#endif
     if(t) {                       // Success?
       lastPolledTime = t;         // Save time
       sketchTime     = millis();  // Save sketch time of last valid time query
-      break;
-    } else {
-        delay(delayForIteration(k));
     } 
   }
   
@@ -307,6 +328,9 @@ boolean sendData() {
   unsigned int nsamp = NUM_SAMP_PER_MSG;
     
   DebugPrint("Free RAM: "); DebugPrintln(getFreeRam(), DEC);
+  
+  // I'm OK, reset time watchdog.
+  //wdt_reset();
 
   // Write msg header. (See documentation at the top of the file.)
   byte *ptr = msg;      
@@ -327,39 +351,30 @@ boolean sendData() {
   ptr += sizeof(nsens);
   DebugPrint(F("Header addr end: ")); DebugPrintln(uint16_t(ptr), HEX);
 
- for (int k=0;!client.connected();k++) {
-    DebugPrintln(F("client is not connected...connecting"));
-    client = getClient();  
-    if (client.connected()) {
-      break;
-    }
-    delay(delayForIteration(k));
-  }
-
   DebugPrint(F("Free RAM: ")); DebugPrintln(getFreeRam());
+  client = getClient();  
 
-// Send request (In HTTP 1.1 connection is persistent by default - keep-alive).
-  if (client.connected()) {
-    
-    int n;
+  // Send request (In HTTP 1.1 connection is persistent by default - keep-alive).    
     DebugPrintln("Start transmission.");
+    wdt_enable(WDTO_4S); // sometime the c3k hangs here. Let use the watchdog timer.
     client.fastrprint(F("POST ")); client.fastrprint(POST_DATA_ENDPOINT); client.fastrprint(F(" HTTP/1.1\r\n"));
     client.fastrprint(F("Host: ")); client.fastrprint(SEDER_HOST); client.fastrprint(F(":")); client.fastrprint(sederPortStr);
        client.fastrprint(F("\r\n"));
     client.fastrprint(F("Content-Length: ")); client.fastrprint(msglen); client.fastrprint("\r\n");
     client.fastrprint(F("Content-Type: application/octet-stream\r\n"));
-    client.fastrprint(F("User-Agent: SEDER_ARD/1.0\r\n"));
+    client.fastrprint(USER_AGENT);
     client.fastrprint(F("\r\n"));
     delay(5); // workaround to give cc3k time to catch up.
     
+    // This is not working, c3k chokes: client.write(msg, MSG_SIZE, 0);
+    // For now we send small chunks. (Retest once TI fixes firmware.)
     int i =0;
     for (;i<numChunks;i++) {
       client.write(msg + i * chunkSize, chunkSize, 0);
       delay(5);
     }
     client.write(msg + i * chunkSize, msgSize % chunkSize, 0);
-
-    //client.write(msg, MSG_SIZE, 0);
+    wdt_disable(); // done with watchdog.
 
     // Handle responses.
     // For now, when response fails, we continue. In the future we must put data in a FIFO queue and
@@ -369,6 +384,7 @@ boolean sendData() {
     ts = millis();
     #endif
     DebugPrint(F("OK\r\nAwaiting response..."));
+    wdt_enable(WDTO_4S); // sometime the c3k hangs here. Let use the watchdog timer.
     int c = 0;
     // Wait for char '!' in response.
     while(((c = timedRead()) > 0) && (c != '!'));
@@ -380,36 +396,16 @@ boolean sendData() {
       DebugPrintln(F("error: invalid response"));
     }
     int32_t r = client.close();
+    wdt_disable(); // done with watchdog.
     DebugPrint(F("close() returned: ")); DebugPrintln(r);
     DebugPrint(F("response time in millisec: ")); DebugPrintln(millis() - ts);
     return (c == '!');
-    
-  } else {
-      DebugPrintln(F("Connection failed"));    
-    return false;
-  }
-  
-  // Print response.  
-//  DebugPrintln(F("-------------------------------------"));
-//
-//  /* Read data until either the connection is closed, or the idle timeout is reached. */ 
-//  unsigned long lastRead = millis();
-//  while (client.connected() && (millis() - lastRead < RESPONSE_TIMEOUT)) {
-//    // DebugPrintln(F("Get response..."));    this loop is a waste, can we improve?
-//    while (client.available()) {
-//      char c = client.read();
-//      DebugPrint(c);
-//      lastRead = millis();
-//    }
-//  }
-//  DebugPrintln(F("-------------------------------------"));
-  
-  // Not calling client.close() and cc3000.disconnect() to keep the connection open between requests. 
-  // If the server disconnects, a new client will be created before sending a request.
 }
 
 Adafruit_CC3000_Client getClient() {
   
+  if(client.connected()) return client;
+ 
   // Get the website IP & print it
   uint32_t ip = 0;
   DebugPrint(SEDER_HOST); DebugPrint(F(" -> "));
@@ -528,58 +524,6 @@ bool displayConnectionDetails(void)
   }
 }
 
-// Minimalist time server query; adapted from Adafruit Gutenbird sketch,
-// which in turn has roots in Arduino UdpNTPClient tutorial.
-unsigned long getTime(void) {
-
-  Adafruit_CC3000_Client gt;
-  uint8_t       buf[48];
-  unsigned long ip, startTime, t = 0L;
-
-  DebugPrint(F("Locating time server..."));
-
-  // Hostname to IP lookup; use NTP pool (rotates through servers)
-  if(cc3000.getHostByName((char *)"pool.ntp.org", &ip)) {
-    static const char PROGMEM
-      timeReqA[] = { 227,  0,  6, 236 },
-      timeReqB[] = {  49, 78, 49,  52 };
-
-    DebugPrintln(F("\r\nAttempting connection..."));
-    startTime = millis();
-    do {
-      gt = cc3000.connectUDP(ip, 123);
-    } while((!gt.connected()) &&
-            ((millis() - startTime) < TIMEOUT));
-
-    if(gt.connected()) {
-      DebugPrint(F("connected!\r\nIssuing request..."));
-
-      // Assemble and issue request packet
-      memset(buf, 0, sizeof(buf));
-      memcpy_P( buf    , timeReqA, sizeof(timeReqA));
-      memcpy_P(&buf[12], timeReqB, sizeof(timeReqB));
-      gt.write(buf, sizeof(buf));
-
-      DebugPrint(F("\r\nAwaiting response..."));
-      memset(buf, 0, sizeof(buf));
-      startTime = millis();
-      while((!gt.available()) &&
-            ((millis() - startTime) < TIMEOUT));
-      if(gt.available()) {
-        gt.read(buf, sizeof(buf));
-        t = (((unsigned long)buf[40] << 24) |
-             ((unsigned long)buf[41] << 16) |
-             ((unsigned long)buf[42] <<  8) |
-              (unsigned long)buf[43]) - 2208988800UL;
-        DebugPrint(F("OK\r\n"));
-      }
-      gt.close();
-    }
-  }
-  if(!t) DebugPrintln(F("error"));
-  return t;
-}
-
 // Read from client stream with a 5 second timeout.  Although an
 // essentially identical method already exists in the Stream() class,
 // it's declared private there...so this is a local copy.
@@ -603,4 +547,60 @@ unsigned long delayForIteration(int iter) {
   }
   DebugPrint(F("wait before retry in millisecs: "));DebugPrintln(d * TIMEOUT);
   return d * TIMEOUT;
+}
+
+// Logs a message at SEDER server. Returns current UTC time in Unix format.
+unsigned long sendLog(char *message) {
+ char len[6];
+ unsigned long utime;
+ snprintf(len, 6, "%d", strlen(message));
+ DebugPrint(F("Log len: "));DebugPrintln(len);
+
+ client = getClient();
+ DebugPrintln("Start log transmission.");
+ wdt_enable(WDTO_4S); // sometime the c3k hangs here. Let use the watchdog timer.
+ client.fastrprint(F("POST ")); client.fastrprint(POST_LOG_ENDPOINT); client.fastrprint(F(" HTTP/1.1\r\n"));
+ client.fastrprint(F("Host: ")); client.fastrprint(SEDER_HOST); client.fastrprint(F(":")); client.fastrprint(sederPortStr);
+ client.fastrprint(F("\r\n"));
+ client.fastrprint(F("Content-Length: ")); client.fastrprint(len); client.fastrprint("\r\n");
+ client.fastrprint(F("Content-Type: application/json\r\n"));
+ client.fastrprint(USER_AGENT);
+ client.fastrprint(F("\r\n"));
+ client.write(message, strlen(message), 0);
+ wdt_reset();
+  
+  boolean flag = false;
+  /* Read data until either the connection is closed, or the idle timeout is reached. */ 
+  // Find start of body by looking for a crlf pair.
+  unsigned long lastRead = millis();
+  while (client.connected() && (millis() - lastRead < TIMEOUT)) {
+      
+      char c;
+      c = client.read();
+      if (c == '\r') {
+        c = client.read();
+        if (c == '\n') {
+          c = client.read();
+          if (c == '\r') {
+            c = client.read();
+            if (c == '\n') {
+              break;
+            }
+          }
+        }
+      }                 
+      lastRead = millis();
+  }
+  // Read response
+  //client.read(&utime, sizeof(utime), 0); // this didn't work, why?
+
+   utime = (((unsigned long)client.read() ) |
+             ((unsigned long)client.read() << 8) |
+             ((unsigned long)client.read() <<  16) |
+              (unsigned long)client.read() << 24);
+ 
+  client.close();
+  wdt_disable();
+  
+  return utime;
 }
