@@ -77,19 +77,23 @@ Adafruit_CC3000 cc3000 = Adafruit_CC3000(ADAFRUIT_CC3000_CS, ADAFRUIT_CC3000_IRQ
 // u long      4       57326        delta time to be added to base time in milliseconds
 // short       2       800          sample period in milliseconds
 // short       2       5            num samples per measurement
-// byte        1       2            num measurements (num analog sensors)
-// TOTAL      33 bytes
+// byte        1       2            num analog variables
+// byte        1       1            num digital variables
+// TOTAL      34 bytes
 #define ACCT_ID_SIZE 10   // define it here so we can allocate the buffer at compile time.
 #define DEVICE_ID_SIZE 10   // define it here so we can allocate the buffer at compile time.
-#define HEAD_SIZE 33 // define it here so we can allocate the buffer at compile time.
-// The data is organized as follows:
-// SAMPLE    SENSOR    VALUE
-// 0         0         123
-// 0         1         23
-// 1         0         112
-// 1         1         25
-// ...
-// values are of type short (a short stores a 16-bit (2-byte) value. This yields a range of -32,768 to 32,767)
+#define HEAD_SIZE 34 // define it here so we can allocate the buffer at compile time.
+// The data is organized as follows. Example 1 digital input, 2 analog inputs.                                                                                                                                    
+// SAMPLE    SENSOR     VALUE                                                                                                                                                                                     
+// 0         D          0x00B00108   4 bytes     << only one word for digital (binary encoded)                                                                                                                                               
+// 0         A0         123          2 bytes                                                                                                                                                                      
+// 0         A1         23           2 bytes                                                                                                                                                                      
+// 1         D          0x00F00208   4 bytes                                                                                                                                                                      
+// 1         A0         112          2 bytes                                                                                                                                                                      
+// 1         A1         25           2 bytes                                                                                                                                                                      
+// ...   
+// digital values are of type unsigned long. Up to 32 digital inputs are encoded in a 32-bit word (4 bytes).
+// analog values are of type short (a short stores a 16-bit (2-byte) value. This yields a range of -32,768 to 32,767)
 // note that the size of int varies for different ATNEL processors and short is always 2 bytes.
 //
 // Sample times can be decoded to msec as follows:
@@ -98,11 +102,14 @@ Adafruit_CC3000 cc3000 = Adafruit_CC3000(ADAFRUIT_CC3000_CS, ADAFRUIT_CC3000_IRQ
 // 1        lastPolledTime * 1000 + (millis() - sketchTime) + 1 * SAMP_PERIOD
 // 2        lastPolledTime * 1000 + (millis() - sketchTime) + 2 * SAMP_PERIOD
 // ...
-#define NUM_SENSORS 2 // number of analog sensors
-#define ANALOG_SIZE 2 // analog value in bytes
-#define NUM_SAMP_PER_MSG 80L // number of sample periods between REST messages
-#define MSG_SIZE NUM_SAMP_PER_MSG * NUM_SENSORS * ANALOG_SIZE + HEAD_SIZE
+#define NUM_ANALOG 3 // number of analog inputs
+#define NUM_DIGITAL 1 // number of digital inputs // max is 32
+#define ANALOG_SIZE 2 // analog value in bytes (one value per analog input)
+#define DIGITAL_SIZE 4 // total size of digital data value in bytes
+#define NUM_SAMP_PER_MSG 20L // number of samples sent in a messages. A sample has NUM_ANALOG values.
+#define MSG_SIZE NUM_SAMP_PER_MSG * (NUM_ANALOG * ANALOG_SIZE + DIGITAL_SIZE) + HEAD_SIZE
 #define CHUNK_SIZE 20L
+#define LIGHT_THRESHOLD 100
 
 Adafruit_CC3000_Client client;
 Adafruit_CC3000_Client getClient();
@@ -124,10 +131,13 @@ int msgSize = MSG_SIZE;
 int chunkSize = CHUNK_SIZE;
 int numChunks = msgSize/chunkSize;
 
-// analog pins in the order they are read.
-// Magnitudes: infrared, ultrasound
-int analogPins[] = {A0,A2}; 
+// analog and digital pins.
+// WARNING!!!! make sure to update NUM_ANALOG and NUM_DIGITAL definitions.
+unsigned char analogPins[] = {A0,A1,A2}; // << length must be NUM_ANALOG
+unsigned char digitalPins[] = {10}; // << length must be NUM_DIGITAL (value range is 0-31)
+
 int ledPin = 13;      // select the pin for the LED
+int nightLightPin = 9;      // select the pin for the LED
 
 void(* resetFunc) (void) = 0; //declare reset function @ address 0
 
@@ -138,6 +148,7 @@ void(* resetFunc) (void) = 0; //declare reset function @ address 0
 \************************************/
 void setup(void)
 {
+  
  int k;
  #ifdef SERIAL_DEBUG_ENABLED > 0
   Serial.begin(115200);
@@ -146,9 +157,17 @@ void setup(void)
   }
  #endif
  
+ 
+ // set the digital pin as output:
+  pinMode(nightLightPin, OUTPUT);     
+  digitalWrite(nightLightPin, HIGH);
+  delay(1000);
+  digitalWrite(nightLightPin, LOW);
+  delay(1000);
+  digitalWrite(nightLightPin, HIGH);
+  
   // Enable watchdog timer.
   //wdt_enable(WDTO_8S);
- 
   DebugPrintln(F("\n\nHello, SEDER!\n")); 
   DebugPrint(F("Free RAM: ")); DebugPrintln(getFreeRam());
   DebugPrintln(F("\nInitialising the CC3000 ..."));
@@ -218,6 +237,8 @@ void setup(void)
   lastPolledTime = sendLog("SEDER setup done.");
   if (lastPolledTime) sketchTime = millis();
   DebugPrint(F("Server time: ")); DebugPrintln(lastPolledTime);
+  
+  digitalWrite(nightLightPin, LOW);
 }
 
 /************************************\
@@ -233,12 +254,7 @@ void loop(void) {
   for(int k=0;sketchTime == 0 || ((millis() - sketchTime > TIME_SERVER_PERIOD) && sampIndex == 0);k++) {            // Time's up?
     unsigned long t;
     wdt_reset(); // reset watchdog timer.
-
-    //#ifdef SERIAL_DEBUG_ENABLED > 0
-      //t  = 111111L; // MOCK FOR TESTING REMEMBER TO CHANGE -- DEBUG
-    //#else
-      t  = sendLog("update time.");
-    //#endif
+    t  = sendLog("update time.");
     if(t) {                       // Success?
       lastPolledTime = t;         // Save time
       sketchTime     = millis();  // Save sketch time of last valid time query
@@ -250,8 +266,17 @@ void loop(void) {
 
     lastSampleTime = millis();    
     
-    for(int i = 0; i < NUM_SENSORS; i++) {
-      writeAnalogValue((short)analogRead(analogPins[i]), sampIndex, i, NUM_SENSORS, msg);
+    // Write digital values to msg buffer.
+//    int val = 0;
+//    for(int i = 0; i < NUM_DIGITAL; i++) {
+//      val |= ((unsigned long)digitalRead(digitalPins[i])) << i;
+//    }
+//    byte *ptr = msg + HEAD_SIZE + sampIndex * DIGITAL_SIZE + (sampIndex * numSensors + sensorIndex) * sizeof(short);      
+//      memcpy(ptr, &val, sizeof(val));
+      
+    // Write analog values to msg buffer.
+    for(int i = 0; i < NUM_ANALOG; i++) {
+      writeAnalogValue((short)analogRead(analogPins[i]), sampIndex, i, NUM_ANALOG, msg);
     }
     
     // Update index after reading all values.
@@ -272,7 +297,12 @@ void loop(void) {
       DebugPrint(F("Sampling Period in milliseconds: "));
       DebugPrintln(SAMP_PERIOD); // add samp period to get time for subsequent samples
 
-      //sendData(fakeid, NUM_SENSORS, msg, lastPolledTime, millis() - sketchTime, SAMP_PERIOD, NUM_SAMP_PER_MSG);
+      // Set nightlight.
+      if (analogRead(analogPins[1]) > LIGHT_THRESHOLD)
+          digitalWrite(nightLightPin, LOW);
+      else
+          digitalWrite(nightLightPin, HIGH);
+
       sendData();
     }
   }
@@ -281,14 +311,14 @@ void loop(void) {
 // Writes a value to the msg buffer.
 void writeAnalogValue(short val, short sampIndex, byte sensorIndex, byte numSensors, byte *msg) {
   
-      byte *ptr = msg + HEAD_SIZE + (sampIndex * numSensors + sensorIndex) * sizeof(short);      
+      byte *ptr = msg + HEAD_SIZE + (sampIndex+1) * DIGITAL_SIZE + (sampIndex * numSensors + sensorIndex) * sizeof(short);      
       memcpy(ptr, &val, sizeof(val));
-//      DebugPrint(F("sampIndex: ")); DebugPrint(sampIndex, DEC);
-//      DebugPrint(F(", sensorIndex: ")); DebugPrint(sensorIndex, DEC);
-//      DebugPrint(F(", val: ")); DebugPrint(val, DEC);
-//      DebugPrint(F(", msg addr start: ")); DebugPrint(uint16_t(msg), HEX);
-//      DebugPrint(F(", msg addr end: ")); DebugPrint(uint16_t(msg + MSG_SIZE), HEX);
-//      DebugPrint(F(", address: ")); DebugPrintln(uint16_t(ptr), HEX);
+      DebugPrint(F("sampIndex: ")); DebugPrint(sampIndex, DEC);
+      DebugPrint(F(", sensorIndex: ")); DebugPrint(sensorIndex, DEC);
+      DebugPrint(F(", val: ")); DebugPrint(val, DEC);
+      DebugPrint(F(", msg addr start: ")); DebugPrint(uint16_t(msg), HEX);
+      DebugPrint(F(", msg addr end: ")); DebugPrint(uint16_t(msg + MSG_SIZE), HEX);
+      DebugPrint(F(", address: ")); DebugPrintln(uint16_t(ptr), HEX);
 }
 
 
@@ -321,7 +351,8 @@ void writeAnalogValue(short val, short sampIndex, byte sensorIndex, byte numSens
 */
 /**************************************************************************/
 boolean sendData() { 
-  byte nsens = NUM_SENSORS;
+  byte nsens = NUM_ANALOG;
+  byte ndig = NUM_DIGITAL;
   unsigned long t1 = lastPolledTime;
   unsigned long t2 = millis() - sketchTime;
   unsigned int per = SAMP_PERIOD;
@@ -349,6 +380,8 @@ boolean sendData() {
   ptr += sizeof(nsamp);
   memcpy(ptr, &nsens, sizeof(nsens));
   ptr += sizeof(nsens);
+  memcpy(ptr, &ndig, sizeof(ndig));
+  ptr += sizeof(ndig);
   DebugPrint(F("Header addr end: ")); DebugPrintln(uint16_t(ptr), HEX);
 
   DebugPrint(F("Free RAM: ")); DebugPrintln(getFreeRam());
